@@ -6,13 +6,24 @@ Edit ZERODHA_* credentials and tweak all parameters here.
 # ══════════════════════════════════════════════
 #  ZERODHA CREDENTIALS  (fill these in)
 # ══════════════════════════════════════════════
-ZERODHA_API_KEY    = "your_api_key_here"
-ZERODHA_API_SECRET = "your_api_secret_here"
-ZERODHA_USER_ID    = "your_user_id_here"
+ZERODHA_API_KEY    = "your_api_key_here"       # From kite.trade developer console
+ZERODHA_API_SECRET = "your_api_secret_here"    # From kite.trade developer console
+ZERODHA_USER_ID    = "your_user_id_here"       # Your Zerodha client ID e.g. AB1234
 
-# After first login Kite Connect gives you an access token.
-# The system auto-saves it here; you can also paste a known token.
-ACCESS_TOKEN_FILE  = "access_token.txt"
+# ── Access Token ───────────────────────────────
+# Option A (recommended for automation): paste your access token directly here.
+#   Get it from: https://kite.trade/connect/login?api_key=YOUR_KEY&v=3
+#   After login, extract 'request_token' from the redirect URL, then call:
+#   kite.generate_session(request_token, api_secret=ZERODHA_API_SECRET)
+#   Access tokens are valid for ONE trading day and must be refreshed daily.
+#
+# Option B: leave as empty string "" — the bot will open a browser for login
+#   and save the token automatically to ACCESS_TOKEN_FILE for re-use.
+ZERODHA_ACCESS_TOKEN = "your_access_token_here"
+
+# Path where the bot auto-saves/loads the access token (used when
+# ZERODHA_ACCESS_TOKEN is left blank or the saved token has expired).
+ACCESS_TOKEN_FILE    = "access_token.txt"
 
 # ══════════════════════════════════════════════
 #  CAPITAL & RISK
