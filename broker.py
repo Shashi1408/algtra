@@ -54,14 +54,19 @@ class ZerodhaBroker:
 
         try:
             self.kite = KiteConnect(api_key=cfg.ZERODHA_API_KEY)
-            token = self._load_token()
+
+            # Priority: 1) hardcoded token in config  2) saved file  3) browser login
+            token = (cfg.ZERODHA_ACCESS_TOKEN
+                     if cfg.ZERODHA_ACCESS_TOKEN not in ("", "your_access_token_here")
+                     else self._load_token())
 
             if token:
                 self.kite.set_access_token(token)
                 # Quick validity check
                 self.kite.profile()
                 self.dry_run = False
-                log.info("[BROKER] ✓ Connected to Zerodha (existing token)")
+                source = "config.py" if token == getattr(cfg, "ZERODHA_ACCESS_TOKEN", "") else "saved file"
+                log.info(f"[BROKER] ✓ Connected to Zerodha (token from {source})")
             else:
                 self._fresh_login()
         except Exception as e:
