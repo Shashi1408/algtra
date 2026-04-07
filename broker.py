@@ -1,6 +1,10 @@
 """
 broker.py — Zerodha Kite Connect wrapper
 Handles authentication, live quotes, historical OHLCV, and order execution.
+
+Fallback data source (paper/dry-run mode): nsetools
+  → pulls live quotes directly from NSE India website (no API key needed).
+  → install: pip install nsetools
 """
 
 import os
@@ -15,13 +19,24 @@ import config as cfg
 
 log = logging.getLogger(__name__)
 
-# ── Try importing kiteconnect; guide user if missing ──────────────────────────
+# ── Try importing kiteconnect ─────────────────────────────────────────────────
 try:
     from kiteconnect import KiteConnect, KiteTicker
     KITE_AVAILABLE = True
 except ImportError:
     KITE_AVAILABLE = False
     log.warning("kiteconnect not installed. Run:  pip install kiteconnect")
+
+# ── Try importing nsetools (paper-mode / dry-run fallback) ───────────────────
+try:
+    from nsetools import Nse as NseTools
+    _nse = NseTools()
+    NSE_TOOLS_AVAILABLE = True
+    log.info("[BROKER] nsetools available — will use for paper-mode data")
+except ImportError:
+    NSE_TOOLS_AVAILABLE = False
+    _nse = None
+    log.warning("nsetools not installed. Run:  pip install nsetools")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,13 +173,7 @@ class ZerodhaBroker:
         instruments, fetch quotes in batches, and rank by % change.
         """
         if self.dry_run:
-            # Fallback hardcoded list for paper trading
-            return [
-                "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
-                "WIPRO", "AXISBANK", "SBIN", "TATAMOTORS", "BAJFINANCE",
-                "HINDUNILVR", "KOTAKBANK", "LT", "MARUTI", "SUNPHARMA",
-                "ULTRACEMCO", "TITAN", "NESTLEIND", "POWERGRID", "NTPC",
-            ]
+            return self._nsetools_top_movers()
         try:
             instr_df = self.get_instruments("NSE")
             # Filter equity, price range
@@ -197,6 +206,79 @@ class ZerodhaBroker:
         except Exception as e:
             log.error(f"[BROKER] get_top_movers: {e}")
             return []
+
+    # ── nsetools helpers (paper / dry-run mode) ───────────────────────────────
+    def _nsetools_top_movers(self) -> list[str]:
+        """
+        Use nsetools to fetch live top gainers + high-volume stocks directly
+        from NSE India. No API key required. Used only in dry-run/paper mode.
+        """
+        if not NSE_TOOLS_AVAILABLE:
+            log.warning("[BROKER] nsetools not available — returning default watchlist")
+            return [
+                "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
+                "WIPRO", "AXISBANK", "SBIN", "TATAMOTORS", "BAJFINANCE",
+                "HINDUNILVR", "KOTAKBANK", "LT", "MARUTI", "SUNPHARMA",
+                "ULTRACEMCO", "TITAN", "NESTLEIND", "POWERGRID", "NTPC",
+            ]
+        try:
+            symbols: set[str] = set()
+
+            # 1. Top gainers from NSE
+            gainers = _nse.get_top_gainers() or []
+            for g in gainers[:15]:
+                sym = g.get("symbol", "")
+                if sym:
+                    symbols.add(sym.upper())
+
+            # 2. 52-week highs (momentum)
+            highs = _nse.get_52_week_high() or []
+            for h in highs[:10]:
+                sym = h.get("symbol", "")
+                if sym:
+                    symbols.add(sym.upper())
+
+            # 3. Stocks in high-liquidity indices
+            for index in ["NIFTY 50", "NIFTY BANK", "NIFTY IT"]:
+                try:
+                    idx_stocks = _nse.get_stocks_in_index(index) or []
+                    for s in idx_stocks:
+                        symbols.add(s.upper())
+                except Exception:
+                    pass
+
+            # Filter by price range using live quotes
+            filtered = []
+            for sym in list(symbols):
+                try:
+                    q = _nse.get_quote(sym.lower())
+                    if q:
+                        ltp = float(q.get("lastPrice") or q.get("last_price") or 0)
+                        if cfg.MIN_PRICE <= ltp <= cfg.MAX_PRICE:
+                            filtered.append(sym)
+                except Exception:
+                    continue
+
+            result = filtered[:cfg.TOP_GAINERS_N] if filtered else list(symbols)[:cfg.TOP_GAINERS_N]
+            log.info(f"[BROKER] nsetools returned {len(result)} movers")
+            return result
+
+        except Exception as e:
+            log.error(f"[BROKER] nsetools top movers failed: {e}")
+            return ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK",
+                    "SBIN", "AXISBANK", "WIPRO", "TATAMOTORS", "BAJFINANCE"]
+
+    def nsetools_get_ltp(self, symbol: str) -> float:
+        """Fetch last traded price via nsetools (dry-run mode)."""
+        if not NSE_TOOLS_AVAILABLE:
+            return 0.0
+        try:
+            q = _nse.get_quote(symbol.lower())
+            if q:
+                return float(q.get("lastPrice") or q.get("last_price") or 0)
+        except Exception as e:
+            log.warning(f"[BROKER] nsetools LTP failed for {symbol}: {e}")
+        return 0.0
 
     # ── Order execution ───────────────────────────────────────────────────────
     def place_order(
