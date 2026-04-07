@@ -4,16 +4,20 @@ main.py — Zerodha Intraday Trading Bot
 Fully automated: screens NSE stocks, applies 8 rule-based strategies + ML
 ensemble, and executes live orders through Zerodha Kite Connect API.
 
+Data sources (in priority order):
+  1. Kite Connect historical API  — live mode (most accurate 5-min OHLCV)
+  2. nsetools                     — paper/dry-run mode (live NSE quotes,
+                                    synthetic OHLCV built from repeated ticks)
+
 Usage:
     python main.py [--paper]      # --paper forces dry-run regardless of credentials
 
 Setup:
-    pip install kiteconnect pandas numpy scikit-learn schedule colorama tabulate
+    pip install kiteconnect nsetools pandas numpy scikit-learn schedule colorama tabulate
 
     1. Fill in config.py with your Zerodha API key/secret/user_id
-    2. Run once; a browser opens for Zerodha login
-    3. Paste the request_token when prompted
-    4. The bot trades automatically until 15:10 IST then squares off
+    2. Run generate_token.py every morning to refresh the access token
+    3. Run:  python main.py
 
 ⚠  DISCLAIMER: This software is for educational purposes. Automated trading
    involves significant financial risk. Use paper-trading mode until you have
@@ -50,15 +54,76 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NSETOOLS SYNTHETIC OHLCV BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+# nsetools gives us live snapshots (LTP, open, high, low, close, volume) but
+# not a historical candle series. We build a synthetic 5-min candle DataFrame
+# by polling nsetools every tick and accumulating rows in memory.
+# This is sufficient for indicator computation in paper/dry-run mode.
+
+_nsetools_cache: dict[str, pd.DataFrame] = {}  # symbol → accumulated OHLCV
+
+try:
+    from nsetools import Nse as _NseTools
+    _nse_client = _NseTools()
+    _NSETOOLS_OK = True
+except ImportError:
+    _nse_client = None
+    _NSETOOLS_OK = False
+
+
+def _nsetools_snapshot(symbol: str) -> Optional[dict]:
+    """Fetch a single live quote snapshot from nsetools."""
+    if not _NSETOOLS_OK:
+        return None
+    try:
+        q = _nse_client.get_quote(symbol.lower())
+        if not q:
+            return None
+        # nsetools quote keys vary slightly by version — handle both
+        ltp   = float(q.get("lastPrice")   or q.get("last_price")   or 0)
+        open_ = float(q.get("open")        or q.get("openPrice")    or ltp)
+        high  = float(q.get("dayHigh")     or q.get("high")         or ltp)
+        low   = float(q.get("dayLow")      or q.get("low")          or ltp)
+        close = float(q.get("previousClose") or q.get("prev_close") or ltp)
+        vol   = float(q.get("totalTradedVolume") or q.get("totalVolume") or 0)
+        return {"Open": open_, "High": high, "Low": low,
+                "Close": ltp, "Volume": vol, "PrevClose": close}
+    except Exception as e:
+        log.warning(f"[NSE] snapshot failed for {symbol}: {e}")
+        return None
+
+
+def _append_nsetools_candle(symbol: str) -> pd.DataFrame:
+    """
+    Append one synthetic candle (timestamped now) to the in-memory cache.
+    Returns the accumulated DataFrame.
+    """
+    snap = _nsetools_snapshot(symbol)
+    if snap is None:
+        return _nsetools_cache.get(symbol, pd.DataFrame())
+
+    row = pd.DataFrame([snap], index=[pd.Timestamp.now()])
+    existing = _nsetools_cache.get(symbol, pd.DataFrame())
+    combined = pd.concat([existing, row]) if not existing.empty else row
+
+    # Keep last 100 synthetic candles (≈ enough for all indicators)
+    _nsetools_cache[symbol] = combined.tail(100)
+    return _nsetools_cache[symbol]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 class DataFetcher:
     """
-    Central OHLCV cache so each module doesn't make redundant API calls.
-    Falls back to yfinance when broker is in dry-run mode.
+    Central OHLCV cache. Priority:
+      1. Kite Connect historical API  (live mode — real 5-min candles)
+      2. nsetools snapshot accumulator (paper/dry-run — synthetic candles
+         built from live NSE quote polls; no third-party scraper needed)
     """
 
     def __init__(self, broker: ZerodhaBroker, instruments_df: pd.DataFrame):
-        self.broker      = broker
-        self._token_map  = {}   # symbol → instrument_token
+        self.broker     = broker
+        self._token_map = {}
         self._cache: dict[str, pd.DataFrame] = {}
 
         if not instruments_df.empty:
@@ -66,6 +131,7 @@ class DataFetcher:
             self._token_map = dict(zip(eq["tradingsymbol"], eq["instrument_token"]))
 
     def fetch(self, symbol: str, interval: str = "5minute", days: int = 5) -> pd.DataFrame:
+        # ── Live mode: Kite Connect historical API ────────────────────────────
         token = self._token_map.get(symbol)
         if token and not self.broker.dry_run:
             df = self.broker.get_historical(int(token), interval, days)
@@ -73,19 +139,23 @@ class DataFetcher:
                 self._cache[symbol] = df
                 return df
 
-        # Fallback: yfinance (paper mode / development)
-        try:
-            import yfinance as yf
-            df = yf.download(f"{symbol}.NS", period="5d", interval="5m",
-                             auto_adjust=True, progress=False)
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            df.dropna(inplace=True)
+        # ── Paper/dry-run mode: nsetools synthetic candles ────────────────────
+        if _NSETOOLS_OK:
+            df = _append_nsetools_candle(symbol)
             if not df.empty:
                 self._cache[symbol] = df
-            return df
-        except Exception as e:
-            log.warning(f"[DATA] yfinance fallback failed for {symbol}: {e}")
-            return pd.DataFrame()
+                log.debug(f"[DATA] {symbol}: {len(df)} nsetools candles accumulated")
+                return df
+            log.warning(f"[DATA] nsetools returned no data for {symbol}")
+        else:
+            log.error(
+                "[DATA] No data source available.\n"
+                "       Live mode  → set Zerodha credentials in config.py\n"
+                "       Paper mode → run:  pip install nsetools"
+            )
+
+        # Return cached data if any (stale but better than empty)
+        return self._cache.get(symbol, pd.DataFrame())
 
     def fetch_many(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
         result = {}
@@ -97,18 +167,24 @@ class DataFetcher:
 
     def get_ltp(self, symbols: list[str]) -> dict[str, float]:
         """Last traded price for each symbol."""
+        # Live mode: Kite Connect quote API
         if not self.broker.dry_run and symbols:
             instruments = [f"{cfg.EXCHANGE}:{s}" for s in symbols]
             quote = self.broker.get_quote(instruments)
             return {k.replace(f"{cfg.EXCHANGE}:", ""): v.get("last_price", 0.0)
                     for k, v in quote.items()}
 
-        # Fallback: read from cache
+        # Paper/dry-run mode: nsetools live quotes (fresh from NSE)
         prices = {}
         for sym in symbols:
-            df = self._cache.get(sym)
-            if df is not None and not df.empty:
-                prices[sym] = float(df["Close"].iloc[-1])
+            ltp = self.broker.nsetools_get_ltp(sym)
+            if ltp > 0:
+                prices[sym] = ltp
+            else:
+                # Last resort: use latest close from accumulated candle cache
+                df = self._cache.get(sym)
+                if df is not None and not df.empty:
+                    prices[sym] = float(df["Close"].iloc[-1])
         return prices
 
 
