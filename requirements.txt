@@ -7,7 +7,10 @@ kiteconnect>=4.2.0
 # Data & numerics
 pandas>=2.0
 numpy>=1.24
-yfinance>=0.2          # fallback / paper-trading data source
+
+# NSE live data — paper/dry-run fallback (pulls directly from NSE India website)
+# Used instead of yfinance which is no longer reliable
+nsetools>=2.0.1
 
 # Machine learning
 scikit-learn>=1.3
