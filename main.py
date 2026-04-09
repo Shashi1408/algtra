@@ -33,6 +33,7 @@ from datetime import datetime
 
 import pandas as pd
 import schedule
+from typing import Optional
 
 import config as cfg
 from broker import ZerodhaBroker
